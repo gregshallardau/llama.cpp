@@ -1,5 +1,6 @@
 #include "server-context.h"
 #include "server-generation-phase.h"
+#include "server-generation-checkpoint.h"
 #include <atomic>
 #include <thread>
 #include "base64.hpp"
@@ -322,6 +323,22 @@ struct server_slot {
     common_chat_input generated;
     // Optional per-slot generation phase observer (never edits the sequence).
     std::unique_ptr<server_generation_phase_tracker> phase_tracker;
+    // Explicitly captured snapshots for this slot. No automatic checkpointing.
+    std::vector<server_generation_checkpoint> generation_checkpoints;
+
+    // Must be called only while this slot is quiescent in the decode thread.
+    // Stored checkpoint is not a full logical conversation/sampler checkpoint.
+    bool capture_generation_checkpoint(const std::string & checkpoint_id, int64_t position) {
+        server_generation_checkpoint snapshot;
+        if (!server_generation_checkpoint_capture(ctx_tgt, ctx_dft, id, position, checkpoint_id, snapshot)) {
+            SLT_WRN(*this, "checkpoint capture failed: id=%s position=%lld\n", checkpoint_id.c_str(), (long long) position);
+            return false;
+        }
+        SLT_INF(*this, "checkpoint captured: id=%s position=%lld bytes=%zu (KV snapshot only; restore not enabled)\n",
+                checkpoint_id.c_str(), (long long) position, snapshot.size_bytes());
+        generation_checkpoints.push_back(std::move(snapshot));
+        return true;
+    }
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
     size_t n_sent_text = 0; // number of sent text character (i.e. handle partial UTF-8 on streaming)
@@ -424,6 +441,7 @@ struct server_slot {
         last_nl_pos    = 0;
         generated      = {};
         phase_tracker.reset();
+        generation_checkpoints.clear();
         has_new_line   = false;
         truncated      = false;
         stop           = STOP_TYPE_NONE;
