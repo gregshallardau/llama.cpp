@@ -1,5 +1,6 @@
 #include "server-context.h"
 #include "server-generation-phase.h"
+#include "server-generation-checkpoint.h"
 #include <atomic>
 #include <thread>
 #include "base64.hpp"
@@ -322,6 +323,104 @@ struct server_slot {
     common_chat_input generated;
     // Optional per-slot generation phase observer (never edits the sequence).
     std::unique_ptr<server_generation_phase_tracker> phase_tracker;
+    // A checkpoint is only safe when its logical state is captured with KV.
+    // Kept separate from the existing prompt-cache checkpoint mechanism.
+    struct generation_restore_point {
+        server_generation_checkpoint kv;
+        server_prompt saved_prompt;
+        common_chat_input saved_generated;
+        common_sampler_ptr saved_sampler;
+        llama_tokens saved_generated_tokens;
+        std::vector<completion_token_output> saved_token_probs;
+        size_t saved_n_sent_text = 0;
+        size_t saved_last_nl_pos = 0;
+        llama_token saved_sampled = LLAMA_TOKEN_NULL;
+        int32_t saved_n_gen = 0;
+        bool saved_has_next_token = true;
+        bool saved_has_new_line = false;
+        bool saved_truncated = false;
+        stop_type saved_stop = STOP_TYPE_NONE;
+        std::string saved_stopping_word;
+    };
+    std::vector<generation_restore_point> generation_checkpoints;
+    bool generation_paused = false;
+
+    // Decode-thread only. A checkpoint is taken at the inter-step boundary,
+    // after any preceding decode is complete. The currently sampled token
+    // may still be pending evaluation; sampled and prompt are captured together.
+    bool capture_generation_checkpoint(const std::string & checkpoint_id, int64_t position) {
+        if (!generation_paused || !task || !smpl || task->params.stream || can_speculate() ||
+            task->type != SERVER_TASK_TYPE_COMPLETION || checkpoint_id.empty()) {
+            SLT_WRN(*this, "checkpoint capture rejected: unsupported or unpaused slot\\n");
+            return false;
+        }
+        generation_restore_point candidate;
+        if (!server_generation_checkpoint_capture(ctx_tgt, ctx_dft, id, position, checkpoint_id, candidate.kv)) {
+            SLT_WRN(*this, "checkpoint capture failed: id=%s position=%lld\\n", checkpoint_id.c_str(), (long long) position);
+            return false;
+        }
+        candidate.saved_prompt = prompt.clone();
+        candidate.saved_generated = generated;
+        candidate.saved_sampler.reset(common_sampler_clone(smpl.get()));
+        if (!candidate.saved_sampler) return false;
+        candidate.saved_generated_tokens = generated_tokens;
+        candidate.saved_token_probs = generated_token_probs;
+        candidate.saved_n_sent_text = n_sent_text;
+        candidate.saved_last_nl_pos = last_nl_pos;
+        candidate.saved_sampled = sampled;
+        candidate.saved_n_gen = stats.n_gen;
+        candidate.saved_has_next_token = has_next_token;
+        candidate.saved_has_new_line = has_new_line;
+        candidate.saved_truncated = truncated;
+        candidate.saved_stop = stop;
+        candidate.saved_stopping_word = stopping_word;
+        SLT_INF(*this, "checkpoint captured: id=%s position=%lld bytes=%zu (KV and logical generation state)\\n",
+                checkpoint_id.c_str(), (long long) position, candidate.kv.size_bytes());
+        // Replace same-ID checkpoint; never silently accumulate unbounded copies.
+        for (auto it = generation_checkpoints.begin(); it != generation_checkpoints.end(); ++it) {
+            if (it->kv.id == checkpoint_id) {
+                generation_checkpoints.erase(it);
+                break;
+            }
+        }
+        if (generation_checkpoints.size() >= 4) generation_checkpoints.erase(generation_checkpoints.begin());
+        generation_checkpoints.push_back(std::move(candidate));
+        return true;
+    }
+
+    bool restore_generation_checkpoint(const std::string & checkpoint_id) {
+        if (!generation_paused || !task || !smpl || task->params.stream || can_speculate() ||
+            task->type != SERVER_TASK_TYPE_COMPLETION) return false;
+        auto it = std::find_if(generation_checkpoints.begin(), generation_checkpoints.end(),
+            [&](const generation_restore_point & p) { return p.kv.id == checkpoint_id; });
+        if (it == generation_checkpoints.end()) return false;
+        // The KV helper attempts rollback on failure; nevertheless the entire
+        // slot must be aborted by the caller on a failed backend write.
+        if (!server_generation_checkpoint_restore_kv(ctx_tgt, ctx_dft, id, it->kv)) {
+            SLT_ERR(*this, "checkpoint restore failed: id=%s; slot must be reset\\n", checkpoint_id.c_str());
+            return false;
+        }
+        prompt = it->saved_prompt.clone();
+        generated = it->saved_generated;
+        common_sampler_copy(it->saved_sampler.get(), smpl.get());
+        generated_tokens = it->saved_generated_tokens;
+        generated_token_probs = it->saved_token_probs;
+        n_sent_text = it->saved_n_sent_text;
+        last_nl_pos = it->saved_last_nl_pos;
+        sampled = it->saved_sampled;
+        stats.n_gen = it->saved_n_gen;
+        has_next_token = it->saved_has_next_token;
+        has_new_line = it->saved_has_new_line;
+        truncated = it->saved_truncated;
+        stop = it->saved_stop;
+        stopping_word = it->saved_stopping_word;
+        // Phase observer stores incremental parsing state; restart its scan
+        // rather than retain a parser position from the discarded suffix.
+        phase_tracker.reset();
+        SLT_INF(*this, "checkpoint restored: id=%s position=%lld (KV, sampler, prompt, generated history)\\n",
+                checkpoint_id.c_str(), (long long) it->kv.logical_token_position);
+        return true;
+    }
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
     size_t n_sent_text = 0; // number of sent text character (i.e. handle partial UTF-8 on streaming)
@@ -424,6 +523,8 @@ struct server_slot {
         last_nl_pos    = 0;
         generated      = {};
         phase_tracker.reset();
+        generation_checkpoints.clear();
+        generation_paused = false;
         has_new_line   = false;
         truncated      = false;
         stop           = STOP_TYPE_NONE;
@@ -3075,7 +3176,37 @@ private:
                         break;
                     }
 
-                    if (task.params.control_action == SERVER_CONTROL_ACTION_REASONING_END) {
+                    if (task.params.control_action == SERVER_CONTROL_ACTION_CHECKPOINT_PAUSE) {
+                        if (slot->task->params.stream || slot->can_speculate() ||
+                            slot->task->type != SERVER_TASK_TYPE_COMPLETION) {
+                            res->success = false;
+                            res->message = "checkpoint controls support only non-streaming non-speculative completions";
+                        } else {
+                            slot->generation_paused = true;
+                            SLT_INF(*slot, "generation checkpoint: paused\\n");
+                            res->success = true;
+                        }
+                    } else if (task.params.control_action == SERVER_CONTROL_ACTION_CHECKPOINT_SAVE) {
+                        res->success = slot->capture_generation_checkpoint(task.params.control_checkpoint_id, slot->prompt.n_tokens());
+                        if (!res->success) res->message = "checkpoint save rejected";
+                    } else if (task.params.control_action == SERVER_CONTROL_ACTION_CHECKPOINT_RESTORE) {
+                        res->success = slot->restore_generation_checkpoint(task.params.control_checkpoint_id);
+                        if (!res->success) {
+                            res->message = "checkpoint restore failed; active generation aborted for safety";
+                            send_error(*slot, res->message);
+                            slot->release();
+                            slot->prompt_clear();
+                        }
+                    } else if (task.params.control_action == SERVER_CONTROL_ACTION_CHECKPOINT_RESUME) {
+                        if (!slot->generation_paused) {
+                            res->success = false;
+                            res->message = "slot is not paused";
+                        } else {
+                            slot->generation_paused = false;
+                            SLT_INF(*slot, "generation checkpoint: resumed\\n");
+                            res->success = true;
+                        }
+                    } else if (task.params.control_action == SERVER_CONTROL_ACTION_REASONING_END) {
                         // the budget sampler only exists when reasoning control was armed
                         if (!slot->task->params.sampling.reasoning_control) {
                             res->success = false;
@@ -3474,7 +3605,7 @@ private:
             bool all_idle = true;
 
             for (auto & slot : slots) {
-                if (slot.is_processing() && !slot.audio_wait) {
+                if (slot.is_processing() && !slot.audio_wait && !slot.generation_paused) {
                     all_idle = false;
                     break;
                 }
@@ -3732,7 +3863,7 @@ private:
 
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS) {
+            if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.generation_paused) {
                 return;
             }
 
@@ -3874,7 +4005,7 @@ private:
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch.size() >= n_batch || slot.generation_paused) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -5916,7 +6047,8 @@ void server_routes::init_routes() {
             res->error(format_error_response("missing completion id", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        if (action != "reasoning_end") {
+        if (action != "reasoning_end" && action != "checkpoint_pause" && action != "checkpoint_save" &&
+            action != "checkpoint_restore" && action != "checkpoint_resume") {
             res->error(format_error_response("unknown control action", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
@@ -5926,7 +6058,12 @@ void server_routes::init_routes() {
             server_task task(SERVER_TASK_TYPE_CONTROL);
             task.id              = rd.get_new_id();
             task.params.control_cmpl_id = cmpl_id;
-            task.params.control_action  = SERVER_CONTROL_ACTION_REASONING_END;
+            task.params.control_action = action == "checkpoint_pause" ? SERVER_CONTROL_ACTION_CHECKPOINT_PAUSE
+                : action == "checkpoint_save" ? SERVER_CONTROL_ACTION_CHECKPOINT_SAVE
+                : action == "checkpoint_restore" ? SERVER_CONTROL_ACTION_CHECKPOINT_RESTORE
+                : action == "checkpoint_resume" ? SERVER_CONTROL_ACTION_CHECKPOINT_RESUME
+                : SERVER_CONTROL_ACTION_REASONING_END;
+            task.params.control_checkpoint_id = json_value(body, "checkpoint_id", std::string());
             rd.post_task(std::move(task));
         }
 
