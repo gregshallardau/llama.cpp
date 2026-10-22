@@ -2114,7 +2114,7 @@ private:
             slot.phase_tracker = std::make_unique<server_generation_phase_tracker>(std::move(markers));
         }
         for (const auto & transition : slot.phase_tracker->append(token_str)) {
-            SLT_INF(slot, "generation phase changed: phase=%s byte_offset=%zu token_id=%d (checkpoint candidate; KV not saved)\\n",
+            SLT_INF(slot, "generation phase changed: phase=%s byte_offset=%zu token_id=%d (checkpoint candidate; KV not saved)\n",
                     server_generation_phase_name(transition.phase), transition.byte_offset, result.tok);
         }
         if (slot.task->params.return_tokens) {
