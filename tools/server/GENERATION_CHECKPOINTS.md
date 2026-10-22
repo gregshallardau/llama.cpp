@@ -45,3 +45,16 @@ derived from the actual logical context by the eventual control API.
 
 This is a development branch and should not be merged as a functional
 checkpoint-restore feature yet.
+
+## Experimental control workflow
+
+Checkpoint controls are routed through the existing POST /control endpoint using the active completion ID. Available actions are checkpoint_pause, checkpoint_save, checkpoint_restore, checkpoint_resume. Save and restore require a non-empty checkpoint_id. Pause the slot before either operation; resume explicitly afterward. All checkpoints are opt-in and tied to a single active completion.
+
+Current implementation rejects streaming and speculative completions; speculative controller and externally streamed bytes cannot be rewound safely. Its snapshot saves the prompt, cloned sampler, pending sampled token, generated text and token history, stopping state, and KV state together. Only four snapshot IDs per slot are retained. Checkpoints disappear upon slot reset.
+
+This is not a complete harness integration. There is no token injection, no filesystem rollback, and no evidence of a successful compiled llama-server run. Integration tests still must cover pause/save/restore/resume, concurrent slots, cancellation, stop strings, context shift, and sampler replay.
+
+Standalone mock check (not a server integration test):
+
+    c++ -std=c++17 -Wall -Wextra -pedantic -Itools/server/tests/generation-checkpoint-mock -Itools/server tools/server/tests/test-generation-checkpoint.cpp -o /tmp/test-generation-checkpoint
+    /tmp/test-generation-checkpoint
