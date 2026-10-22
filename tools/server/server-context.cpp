@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-generation-phase.h"
 #include <atomic>
 #include <thread>
 #include "base64.hpp"
@@ -319,6 +320,8 @@ struct server_slot {
     size_t last_nl_pos = 0;
 
     common_chat_input generated;
+    // Optional per-slot generation phase observer (never edits the sequence).
+    std::unique_ptr<server_generation_phase_tracker> phase_tracker;
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
     size_t n_sent_text = 0; // number of sent text character (i.e. handle partial UTF-8 on streaming)
@@ -420,6 +423,7 @@ struct server_slot {
 
         last_nl_pos    = 0;
         generated      = {};
+        phase_tracker.reset();
         has_new_line   = false;
         truncated      = false;
         stop           = STOP_TYPE_NONE;
@@ -2091,6 +2095,28 @@ private:
         slot.sampled = result.tok;
 
         slot.generated.append(token_str, result.tok);
+
+        // Explicit opt-in. Empty/unset start markers leave inference unchanged.
+        // These are template-specific marker strings, NOT automatically detected tokens.
+        if (!slot.phase_tracker) {
+            std::vector<server_generation_marker> markers;
+            const auto add_markers = [&markers](const char * start_key, const char * end_key,
+                                                server_generation_phase phase) {
+                const char * start = std::getenv(start_key);
+                const char * end   = std::getenv(end_key);
+                if (start && *start) markers.push_back({start, phase, false});
+                if (end   && *end)   markers.push_back({end,   phase, true});
+            };
+            add_markers("LLAMA_PHASE_REASONING_START", "LLAMA_PHASE_REASONING_END",
+                        server_generation_phase::reasoning);
+            add_markers("LLAMA_PHASE_TOOL_START", "LLAMA_PHASE_TOOL_END",
+                        server_generation_phase::tool_call);
+            slot.phase_tracker = std::make_unique<server_generation_phase_tracker>(std::move(markers));
+        }
+        for (const auto & transition : slot.phase_tracker->append(token_str)) {
+            SLT_INF(slot, "generation phase changed: phase=%s byte_offset=%zu token_id=%d (checkpoint candidate; KV not saved)\\n",
+                    server_generation_phase_name(transition.phase), transition.byte_offset, result.tok);
+        }
         if (slot.task->params.return_tokens) {
             slot.generated_tokens.push_back(result.tok);
         }
