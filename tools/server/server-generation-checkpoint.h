@@ -61,3 +61,46 @@ inline bool server_generation_checkpoint_capture(
     output = std::move(candidate);
     return true;
 }
+
+// Restores only the llama sequence payloads. This deliberately does NOT resume
+// generation: the owner must separately restore the prompt, sampler, generated
+// text/tokens, speculative controller, and streaming cursor from the same boundary.
+// The owning decode thread must be quiescent and no batch may be in flight.
+// If a write fails, attempt to restore both pre-call snapshots. Since a backend
+// may reject rollback too, callers must abort/reinitialize the slot on failure.
+inline bool server_generation_checkpoint_restore_sequence(
+        llama_context * ctx, llama_seq_id seq_id, const std::vector<uint8_t> & state) {
+    return ctx && !state.empty() &&
+        llama_state_seq_set_data_ext(ctx, state.data(), state.size(), seq_id,
+                                     LLAMA_STATE_SEQ_FLAGS_NONE) == state.size();
+}
+
+inline bool server_generation_checkpoint_restore_kv(
+        llama_context * target, llama_context * draft, llama_seq_id seq_id,
+        const server_generation_checkpoint & snapshot) {
+    if (!snapshot.valid() || !target || seq_id < 0 || snapshot.seq_id != seq_id ||
+        (draft == nullptr) != snapshot.draft_state.empty()) {
+        return false;
+    }
+
+    // Capture the live state before touching either context.
+    std::vector<uint8_t> previous_target;
+    std::vector<uint8_t> previous_draft;
+    if (!server_generation_checkpoint_capture_sequence(target, seq_id, previous_target) ||
+        (draft && !server_generation_checkpoint_capture_sequence(draft, seq_id, previous_draft))) {
+        return false;
+    }
+
+    if (server_generation_checkpoint_restore_sequence(target, seq_id, snapshot.target_state) &&
+        (!draft || server_generation_checkpoint_restore_sequence(draft, seq_id, snapshot.draft_state))) {
+        return true;
+    }
+
+    // Best-effort recovery. A failure still leaves the slot unusable until
+    // its owner resets it, even if these calls appear to succeed.
+    server_generation_checkpoint_restore_sequence(target, seq_id, previous_target);
+    if (draft) {
+        server_generation_checkpoint_restore_sequence(draft, seq_id, previous_draft);
+    }
+    return false;
+}
