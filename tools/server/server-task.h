@@ -56,6 +56,10 @@ enum server_control_action {
     SERVER_CONTROL_ACTION_REASONING_END,
     SERVER_CONTROL_ACTION_AUDIO_APPEND, // push control_audio into the slot's audio stream
     SERVER_CONTROL_ACTION_AUDIO_COMMIT, // flush the audio stream, more audio can follow
+    SERVER_CONTROL_ACTION_CHECKPOINT_PAUSE,
+    SERVER_CONTROL_ACTION_CHECKPOINT_SAVE,
+    SERVER_CONTROL_ACTION_CHECKPOINT_RESTORE,
+    SERVER_CONTROL_ACTION_CHECKPOINT_RESUME,
     SERVER_CONTROL_ACTION_AUDIO_END,    // flush the audio stream and end it
 };
 
@@ -99,6 +103,7 @@ struct task_params {
     // realtime control (SERVER_TASK_TYPE_CONTROL)
     server_control_action control_action = SERVER_CONTROL_ACTION_NONE;
     std::string           control_cmpl_id;
+    std::string           control_checkpoint_id;
     std::vector<float>    control_audio; // PCM F32 samples for SERVER_CONTROL_ACTION_AUDIO_APPEND
 
     // reported in generation_settings, parsing itself is owned by the chat session
