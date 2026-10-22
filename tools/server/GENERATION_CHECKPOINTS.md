@@ -4,6 +4,14 @@ This branch adds a real, explicit **sequence state snapshot** primitive using
 `llama_state_seq_get_size_ext` and `llama_state_seq_get_data_ext`.
 It is not a constant-time token-position bookmark: the state is copied.
 
+The branch also provides `server_generation_checkpoint_restore_kv()` for a guarded
+round-trip of the target and optional draft **KV sequence state only**. It rejects
+sequence mismatches and model-pair mismatches, snapshots both live states before
+writing, and attempts to recover the pre-call states on failure. A failed
+restore must be treated as a poisoned slot and reinitialized; best-effort
+recovery is not a transactional guarantee. Neither capture nor restore is
+wired to phase markers or a public HTTP route.
+
 The server slot has `capture_generation_checkpoint(checkpoint_id, token_position)`,
 which captures both target and optional draft contexts, stores them under a
 slot-scoped identifier, and logs either:
